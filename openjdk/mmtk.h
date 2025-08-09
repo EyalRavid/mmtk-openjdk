@@ -287,8 +287,16 @@ inline uint8_t mmtk_get_rc_8bits(void* o) {
     return byte;
 }
 
-inline uint8_t mmtk_get_rc(void* o) {
-    return mmtk_get_rc_2bits(o);
+//Eyal added this. This func is almost the same as mmtk_get_rc_8bits
+inline uint16_t mmtk_get_rc_16bits(void* o) {
+    const uintptr_t index = uintptr_t((void*) o) >> log_min_obj_size;
+    const uint16_t int16 = *((uint16_t*) (RC_TABLE_BASE_ADDRESS + (index << 1 )));
+    return int16;
+}
+
+
+inline uint16_t mmtk_get_rc(void* o) {
+    return mmtk_get_rc_2bits(o); //was mmtk_get_rc_2bits(o)
 }
 
 extern void mmtk_builder_read_env_var_settings();
