@@ -294,9 +294,21 @@ inline uint16_t mmtk_get_rc_16bits(void* o) {
     return int16;
 }
 
+inline uint32_t mmtk_get_rc_32bits(void* o) {
+    const uintptr_t index = uintptr_t((void*) o) >> log_min_obj_size;
+    const uint32_t int32 = *((uint32_t*) (RC_TABLE_BASE_ADDRESS + (index << 2 )));
+    return int32;
+}
+
+inline uint64_t mmtk_get_rc_64bits(void* o) {
+    const uintptr_t index = uintptr_t((void*) o) >> log_min_obj_size;
+    const uint64_t int64 = *((uint64_t*) (RC_TABLE_BASE_ADDRESS + (index << 3 )));
+    return int64;
+}
+
 
 inline uint16_t mmtk_get_rc(void* o) {
-    return mmtk_get_rc_16bits(o); //was mmtk_get_rc_2bits(o)
+    return mmtk_get_rc_32bits(o); //was mmtk_get_rc_2bits(o)
 }
 
 extern void mmtk_builder_read_env_var_settings();
