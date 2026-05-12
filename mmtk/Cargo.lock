@@ -602,7 +602,6 @@ dependencies = [
  "num_cpus",
  "pfm",
  "portable-atomic",
- "probe",
  "regex",
  "rustversion",
  "spin",
