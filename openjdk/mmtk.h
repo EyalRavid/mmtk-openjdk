@@ -308,7 +308,7 @@ inline uint64_t mmtk_get_rc_64bits(void* o) {
 
 
 inline uint16_t mmtk_get_rc(void* o) {
-    return mmtk_get_rc_32bits(o); //was mmtk_get_rc_2bits(o)
+    return mmtk_get_rc_2bits(o); //was mmtk_get_rc_2bits(o)
 }
 
 extern void mmtk_builder_read_env_var_settings();
