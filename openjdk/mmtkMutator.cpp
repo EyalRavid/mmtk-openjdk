@@ -26,6 +26,7 @@ bool MMTkMutatorContext::is_ready_to_bind() {
 }
 
 HeapWord* MMTkMutatorContext::alloc(size_t bytes, Allocator allocator) {
+  assert(bytes >= 2 * HeapWordSize, "object must be at least 2 words");
   // All allocations with size larger than max non-los bytes will get to this slowpath here.
   // We will use LOS for those.
   assert(MMTkMutatorContext::max_non_los_default_alloc_bytes != 0, "max_non_los_default_alloc_bytes hasn't been initialized");

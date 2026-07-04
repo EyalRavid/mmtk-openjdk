@@ -89,6 +89,7 @@ void MMTkBarrierSetAssembler::eden_allocate(MacroAssembler* masm, Register threa
     // end = obj + size
     Register end = t1;
     if (var_size_in_bytes == noreg) {
+      assert(con_size_in_bytes >= 2 * HeapWordSize, "constant alloc size too small");
       __ lea(end, Address(obj, con_size_in_bytes));
     } else {
       __ lea(end, Address(obj, var_size_in_bytes, Address::times_1));
