@@ -103,9 +103,14 @@ void MMTkBarrierSetAssembler::eden_allocate(MacroAssembler* masm, Register threa
     __ movptr(cursor, end);
   bool enable_vo_bit = false;
   #ifdef MMTK_ENABLE_VO_BIT
+  // The VO-bit store below hardcodes 8-byte metadata granularity (>> 6 for the byte, >> 3 for the
+  // bit), but VO_BIT is specced at LOG_MIN_OBJECT_SIZE. At a coarser granularity it silently
+  // writes the wrong bit.
+  static_assert(log_min_obj_size == 3, "VO-bit fast path hardcodes 8-byte metadata granularity");
   enable_vo_bit = true;
   #endif
   if (enable_vo_bit || selector.tag == TAG_MARK_COMPACT) {
+    guarantee(log_min_obj_size == 3, "VO-bit fast path hardcodes 8-byte metadata granularity");
     Register tmp3 = rdi;
     Register tmp2 = rscratch1;
     assert_different_registers(obj, tmp2, tmp3, rcx);

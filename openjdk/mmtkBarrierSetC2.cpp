@@ -275,9 +275,14 @@ void MMTkBarrierSetC2::expand_allocate(PhaseMacroExpand* x,
 
     bool enable_vo_bit = false;
     #ifdef MMTK_ENABLE_VO_BIT
+    // The VO-bit store below hardcodes 8-byte metadata granularity (>> 6 for the byte, >> 3 for
+    // the bit), but VO_BIT is specced at LOG_MIN_OBJECT_SIZE. At a coarser granularity it
+    // silently writes the wrong bit.
+    static_assert(log_min_obj_size == 3, "VO-bit fast path hardcodes 8-byte metadata granularity");
     enable_vo_bit = true;
     #endif
   if (enable_vo_bit || selector.tag == TAG_MARK_COMPACT) {
+    guarantee(log_min_obj_size == 3, "VO-bit fast path hardcodes 8-byte metadata granularity");
     // set the alloc bit:
     // intptr_t addr = (intptr_t) (void*) fast_oop;
     // uint8_t* meta_addr = (uint8_t*) (VO_BIT_BASE_ADDRESS + (addr >> 6));
