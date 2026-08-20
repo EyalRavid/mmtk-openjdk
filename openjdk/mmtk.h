@@ -265,7 +265,7 @@ extern void add_phantom_candidate(void* ref, void* referent);
 extern void mmtk_harness_begin_impl();
 extern void mmtk_harness_end_impl();
 
-constexpr size_t log_min_obj_size = 3;
+constexpr size_t log_min_obj_size = 4;
 
 inline uint8_t mmtk_get_rc_2bits(void* o) {
     const uintptr_t index = uintptr_t((void*) o) >> log_min_obj_size;
