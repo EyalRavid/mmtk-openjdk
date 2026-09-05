@@ -85,10 +85,16 @@ impl<const COMPRESSED: bool> Collection<OpenJDK<COMPRESSED>> for VMCollection {
         DISCOVERED_LISTS.process_phantom_refs::<E, COMPRESSED>(worker)
     }
 
+    /// Run the VM's weak-root pass: clear weak roots whose target is dead, forward the ones
+    /// whose target moved.
+    ///
+    /// Re-enabled 2026-09-04. It was commented out by `8e987da` ("Disable class unloading"),
+    /// which switched off weak-root handling and class unloading together. Only the weak half is
+    /// restored here; `unload_classes` below stays disabled.
     fn update_weak_processor(lxr: bool) {
-        // unsafe {
-        //     ((*UPCALLS).update_weak_processor)(lxr);
-        // }
+        unsafe {
+            ((*UPCALLS).update_weak_processor)(lxr);
+        }
     }
 
     fn clear_cld_claimed_marks() {

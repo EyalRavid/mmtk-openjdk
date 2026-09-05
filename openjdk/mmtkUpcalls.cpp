@@ -107,28 +107,46 @@ public:
     return MMTkForwardClosure::is_forwarded(MMTkForwardClosure::read_forwarding_word(o));
   }
 
+  // Follow a forwarding pointer, if there is one, and then ask about liveness.
+  //
+  // "Forwarded" does NOT imply "alive" in a reference-counting pause. Evacuation happens in the
+  // increment phase; an object can move and then have its refcount fall to zero in the decrement
+  // phase, or be freed by cycle collection afterwards. The old test was `rc_live(o) ||
+  // is_forwarded(o)`, which reports such an object live and leaves callers holding a pointer to
+  // freed memory. That was sound only while this closure ran exclusively in `Pause::Full` /
+  // `Pause::FinalMark`, where a full trace has already decided what is live before anything moves.
+  static inline bool live_after_forwarding(oop o) {
+    const auto status = MMTkForwardClosure::read_forwarding_word(o);
+    if (MMTkForwardClosure::is_forwarded(status)) {
+      return rc_live(MMTkForwardClosure::extract_forwarding_pointer(status));
+    }
+    return rc_live(o);
+  }
+
   inline virtual bool do_object_b(oop o) {
-    const uintptr_t v = uintptr_t((void*) o);
-    // if (v >= 0x220000000000ULL || v < 0x20000000000ULL) return false;
-    return o != NULL && (rc_live(o) || is_forwarded(o));
+    return o != NULL && live_after_forwarding(o);
   }
 };
 
+// Resolves one weak root slot: forward it if its target moved, null it if its target is dead.
+//
+// The `heap_start`/`heap_end` members this class used to carry referred to `HEAP_START` and
+// `HEAP_END`, which are declared nowhere -- not in a header, not exported from the Rust side. The
+// class was never instantiated, so its constructor was never emitted and the undefined symbols
+// never reached the linker. They do now, so the bounds check is gone: no other closure in this
+// file performs one, there is no heap-bounds accessor in the binding to reimplement it with, and
+// weak roots hold oops by construction. The NULL check the bounds test was implicitly performing
+// is kept explicitly below.
 class MMTkLXRFastUpdateClosure : public OopClosure {
-  uintptr_t heap_start = HEAP_START;
-  uintptr_t heap_end = HEAP_END;
-
  public:
   inline virtual void do_oop(oop* slot) {
-    const auto o = *slot;
-    const uintptr_t v = uintptr_t((void*) o);
-    if (v >= heap_end || v < heap_start) {
-      *slot = NULL;
-      return;
-    }
+    const oop o = *slot;
+    if (o == NULL) return;
     const auto status = MMTkForwardClosure::read_forwarding_word(o);
     if (MMTkForwardClosure::is_forwarded(status)) {
-      *slot = MMTkForwardClosure::extract_forwarding_pointer(status);
+      // Moved -- but the copy may since have died, so test the forwardee, not the husk.
+      const oop fwd = MMTkForwardClosure::extract_forwarding_pointer(status);
+      *slot = MMTkLXRFastIsAliveClosure::rc_live(fwd) ? fwd : oop(NULL);
     } else if (!MMTkLXRFastIsAliveClosure::rc_live(o)) {
       *slot = NULL;
     }
@@ -136,15 +154,17 @@ class MMTkLXRFastUpdateClosure : public OopClosure {
   inline virtual void do_oop(narrowOop* slot) {
     narrowOop heap_oop = RawAccess<>::oop_load(slot);
     if (CompressedOops::is_null(heap_oop)) return;
+    // `is_null` above already covers the NULL case, and `decode_not_null` yields an in-heap
+    // address by construction.
     oop o = CompressedOops::decode_not_null(heap_oop);
-    const uintptr_t v = uintptr_t((void*) o);
-    if (v >= heap_end || v < heap_start) {
-      RawAccess<>::oop_store(slot, CompressedOops::encode(oop(NULL)));
-      return;
-    }
     const auto status = MMTkForwardClosure::read_forwarding_word(o);
     if (MMTkForwardClosure::is_forwarded(status)) {
-      RawAccess<>::oop_store(slot, CompressedOops::encode_not_null(MMTkForwardClosure::extract_forwarding_pointer(status)));
+      // Moved -- but the copy may since have died, so test the forwardee, not the husk.
+      const oop fwd = MMTkForwardClosure::extract_forwarding_pointer(status);
+      RawAccess<>::oop_store(slot,
+          MMTkLXRFastIsAliveClosure::rc_live(fwd)
+              ? CompressedOops::encode_not_null(fwd)
+              : CompressedOops::encode(oop(NULL)));
     } else if (!MMTkLXRFastIsAliveClosure::rc_live(o)) {
       RawAccess<>::oop_store(slot, CompressedOops::encode(oop(NULL)));
     }
@@ -203,8 +223,15 @@ static void mmtk_clear_claimed_marks() {
 static void mmtk_update_weak_processor(bool lxr) {
   HandleMark hm;
   if (lxr) {
+    // `is_alive` decides whether an entry survives; `keep_alive` is applied to the survivors.
+    // The second argument used to be `do_nothing_cl`, which cleared dead entries but left
+    // surviving ones pointing at their pre-evacuation addresses. LXR evacuates young objects, so
+    // that leaves stale weak roots. `MMTkLXRFastUpdateClosure` is the closure written for this --
+    // it rewrites a forwarded slot to the new address and nulls a slot whose target has rc == 0.
+    // It was defined and never wired up.
     MMTkLXRFastIsAliveClosure is_alive;
-    WeakProcessor::weak_oops_do(&is_alive, &do_nothing_cl);
+    MMTkLXRFastUpdateClosure update;
+    WeakProcessor::weak_oops_do(&is_alive, &update);
   } else {
     MMTkIsAliveClosure is_alive;
     MMTkForwardClosure forward;
