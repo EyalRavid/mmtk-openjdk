@@ -47,6 +47,8 @@
 #include "gc/shared/oopStorage.inline.hpp"
 #include "utilities/debug.hpp"
 #include "classfile/systemDictionary.hpp"
+#include "oops/fieldStreams.hpp"
+#include "logging/log.hpp"
 #include "prims/jvmtiExport.hpp"
 #include "runtime/jniHandles.hpp"
 #include "utilities/macros.hpp"
@@ -548,6 +550,123 @@ static void* mmtk_swap_reference_pending_list(void* object) {
   return Universe::swap_reference_pending_list((oop) object);
 }
 
+// Walk `java.lang.ref.Finalizer.unfinalized`, reporting every (finalizer, referent) pair.
+//
+// `unfinalized` is a single STATIC field holding the head of a doubly-linked list; the chain
+// itself is ordinary heap objects linked by `next`. One static read plus a walk therefore
+// enumerates every finalizable object in the VM, with no reference discovery needed.
+//
+// STOP-THE-WORLD ONLY. Finalizer.lock guards the list at runtime and this takes no lock.
+//
+// NOTE the field we follow is `Finalizer.next`, NOT `Reference.next`. Both exist and both are
+// declared `Reference`-typed; `Finalizer.next` links the unfinalized list, `Reference.next`
+// links the ReferenceQueue. `JavaFieldStream` iterates only the fields declared *locally* on
+// the klass it is given, which is what keeps these apart -- do not switch it to a lookup that
+// walks superclasses.
+static void mmtk_scan_finalizer_list(MMTkFinalizerVisitor visit, void* ctx) {
+  static int unfinalized_offset = -1;
+  static int next_offset = -1;
+
+  InstanceKlass* ik = SystemDictionary::Finalizer_klass();
+  if (ik == NULL || !ik->is_initialized()) return;
+
+  if (unfinalized_offset < 0 || next_offset < 0) {
+    for (JavaFieldStream fs(ik); !fs.done(); fs.next()) {
+      if (fs.name()->equals("unfinalized")) {
+        guarantee(fs.access_flags().is_static(), "Finalizer.unfinalized must be static");
+        unfinalized_offset = fs.offset();
+      } else if (fs.name()->equals("next")) {
+        guarantee(!fs.access_flags().is_static(), "Finalizer.next must be an instance field");
+        next_offset = fs.offset();
+      }
+    }
+    guarantee(unfinalized_offset >= 0 && next_offset >= 0,
+              "could not resolve Finalizer.unfinalized / Finalizer.next");
+  }
+
+  // Bounded walk. Every anomaly below is impossible if the list is well formed -- but a
+  // malformed list must not be able to hang the VM or silently truncate the walk, because both
+  // present as unexplained retention with nothing in the log, which is exactly the failure mode
+  // that took two investigations to find in the first place. See FINALIZER_RC_IMPLEMENTATION.md.
+  //
+  // The cap is far above any plausible finalizable population; hitting it means a cycle of
+  // length > 1, which the self-link check below cannot see.
+  const size_t MAX_FINALIZER_WALK = 10 * 1000 * 1000;
+  size_t walked = 0;
+  size_t null_referent = 0;
+
+  // A static field lives in the klass mirror.
+  oop f = HeapAccess<AS_NO_KEEPALIVE>::oop_load_at(ik->java_mirror(), unfinalized_offset);
+  while (f != NULL) {
+    if (++walked > MAX_FINALIZER_WALK) {
+      log_warning(gc)("MMTk: Finalizer.unfinalized walk exceeded " SIZE_FORMAT
+                      " nodes and was abandoned -- the list is malformed (a cycle longer than "
+                      "one node). Finalization is now incomplete.", MAX_FINALIZER_WALK);
+      break;
+    }
+    // Report only finalizers that have NOT already been handed to Java. The guard is the
+    // Reference's own Java state, not anything the collector remembers -- state we remember is
+    // state that can go stale, and a stale "already enqueued" mark silently suppresses
+    // finalization of whatever object later occupies that address.
+    //
+    // The lifecycle, from ReferenceQueue.java / Reference.java in this tree:
+    //
+    //   spliced onto the VM pending list   discovered != null      (we set it)
+    //   ReferenceHandler pops it           discovered  = null
+    //     then ReferenceQueue.enqueue      next = head or self     (ReferenceQueue.java:70)
+    //                                      queue = ENQUEUED        (:76)
+    //   FinalizerThread reallyPoll         queue = NULL, next = self (:88, :98)
+    //   Finalizer.runFinalizer             Finalizer.next = this, then referent = null
+    //
+    // So `discovered != null` covers the pending list, `Reference.next != null` covers
+    // everything from ReferenceQueue.enqueue onwards, and `referent == null` covers a finalizer
+    // that has already run. Reference.java:84 documents `discovered != null` as exactly this
+    // "already discovered" marker, and object_scanning.rs uses it the same way for
+    // ReferenceType::Final.
+    //
+    // Residual: a few instructions inside ReferenceHandler, after `discovered = null` and before
+    // `enqueue` sets `next`, where none of the three holds. Splicing there is harmless -- the
+    // handler's local cursor has already moved past this node, so it simply becomes the head of
+    // a fresh pending list, and the second `ReferenceQueue.enqueue` returns false on
+    // `queue == ENQUEUED` (ReferenceQueue.java:66-68). No double finalization.
+    oop referent = HeapAccess<AS_NO_KEEPALIVE>::oop_load_at(
+        f, java_lang_ref_Reference::referent_offset);
+    oop discovered = HeapAccess<AS_NO_KEEPALIVE>::oop_load_at(
+        f, java_lang_ref_Reference::discovered_offset);
+    oop ref_next = HeapAccess<AS_NO_KEEPALIVE>::oop_load_at(
+        f, java_lang_ref_Reference::next_offset);
+    if (referent != NULL && discovered == NULL && ref_next == NULL) {
+      visit((void*) f, (void*) referent, ctx);
+    } else if (referent == NULL) {
+      // Should be unreachable: `runFinalizer` unlinks the node from this list BEFORE
+      // `super.clear()` nulls the referent, so a null-referent node is never on the list. If one
+      // ever is, it is stuck for good -- we skip it, so it is never enqueued, so `runFinalizer`
+      // never runs, so `remove()` never unlinks it. Counted and reported rather than ignored.
+      null_referent++;
+    }
+    // NOTE: `next_offset` here is Finalizer.next (the unfinalized-list link), NOT
+    // Reference.next read above. Both are Reference-typed and they mean different things.
+    oop next = HeapAccess<AS_NO_KEEPALIVE>::oop_load_at(f, next_offset);
+    // `runFinalizer` marks a finalized node with `next == this` AFTER unlinking it, so a
+    // self-linked node should be unreachable from the head. Stopping is the only option that
+    // terminates, but stopping mid-list silently would skip every finalizer after this point --
+    // so say so.
+    if (next == f) {
+      log_warning(gc)("MMTk: Finalizer.unfinalized contains a self-linked node after "
+                      SIZE_FORMAT " nodes; walk stopped early and finalization is incomplete.",
+                      walked);
+      break;
+    }
+    f = next;
+  }
+
+  if (null_referent != 0) {
+    log_warning(gc)("MMTk: " SIZE_FORMAT " finalizer(s) on Finalizer.unfinalized have a null "
+                    "referent and are permanently stuck -- nothing will ever remove them.",
+                    null_referent);
+  }
+}
+
 static size_t mmtk_java_lang_class_klass_offset_in_bytes() {
   auto v = java_lang_Class::klass_offset_in_bytes();
   guarantee(v != 0 && v != -1, "checking");
@@ -611,4 +730,5 @@ OpenJDK_Upcalls mmtk_upcalls = {
   mmtk_clear_claimed_marks,
   mmtk_unload_classes,
   mmtk_gc_epilogue,
+  mmtk_scan_finalizer_list,
 };

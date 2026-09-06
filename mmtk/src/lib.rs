@@ -135,13 +135,34 @@ pub struct OpenJDK_Upcalls {
     pub prepare_for_roots_re_scanning: extern "C" fn(),
     pub update_weak_processor: extern "C" fn(lxr: bool),
     pub enqueue_references: extern "C" fn(objects: *const ObjectReference, len: usize),
-    pub swap_reference_pending_list: extern "C" fn(objects: ObjectReference) -> ObjectReference,
+    /// Atomically install `objects` as the head of the VM's pending-reference list and return
+    /// the previous head.
+    ///
+    /// The return is `Option` because the C side (`Universe::swap_reference_pending_list`,
+    /// declared `void*` in `mmtk.h`) returns NULL whenever the list was empty -- which is the
+    /// common case, since ReferenceHandler drains it promptly. Declaring it as a bare
+    /// `ObjectReference` would hand a zero to a `NonZeroUsize`, violating that type's invariant.
+    /// It happened to behave correctly only because `Option<ObjectReference>` is niche-optimised
+    /// so `Some(0)` and `None` share a bit pattern; that is a coincidence of layout, not
+    /// something the code was entitled to rely on.
+    pub swap_reference_pending_list:
+        extern "C" fn(objects: ObjectReference) -> Option<ObjectReference>,
     pub java_lang_class_klass_offset_in_bytes: extern "C" fn() -> usize,
     pub java_lang_classloader_loader_data_offset: extern "C" fn() -> usize,
     pub nmethod_fix_relocation: extern "C" fn(Address),
     pub clear_claimed_marks: extern "C" fn(),
     pub unload_classes: extern "C" fn(),
     pub gc_epilogue: extern "C" fn(),
+    /// Walk `java.lang.ref.Finalizer.unfinalized`, invoking `visit` once per registered
+    /// finalizable object with `(finalizer, referent, ctx)`. Stop-the-world only.
+    ///
+    /// APPENDED LAST, and must stay last: this struct is laid out by position and is mirrored
+    /// in `openjdk/mmtk.h` and the initializer in `mmtkUpcalls.cpp`. Inserting anywhere else
+    /// silently shifts every later slot into the wrong function.
+    pub scan_finalizer_list: extern "C" fn(
+        visit: extern "C" fn(*mut libc::c_void, *mut libc::c_void, *mut libc::c_void),
+        ctx: *mut libc::c_void,
+    ),
 }
 
 lazy_static! {

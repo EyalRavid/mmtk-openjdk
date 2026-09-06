@@ -2,6 +2,7 @@ use mmtk::gc_log;
 use mmtk::scheduler::{GCWorker, ProcessEdgesWork};
 use mmtk::util::alloc::AllocationError;
 use mmtk::util::opaque_pointer::*;
+use mmtk::util::ObjectReference;
 use mmtk::vm::{Collection, GCThreadContext};
 use mmtk::Mutator;
 
@@ -95,6 +96,45 @@ impl<const COMPRESSED: bool> Collection<OpenJDK<COMPRESSED>> for VMCollection {
         unsafe {
             ((*UPCALLS).update_weak_processor)(lxr);
         }
+    }
+
+    /// Walk `java.lang.ref.Finalizer.unfinalized` and collect every `(finalizer, referent)`.
+    ///
+    /// The upcall reports pairs through a callback rather than returning a buffer, so nothing
+    /// has to be allocated on the VM side or freed across the FFI boundary. `ctx` carries a
+    /// `&mut Vec` through the C call; `visit` is only ever invoked synchronously from inside
+    /// `scan_finalizer_list`, so the borrow cannot outlive this function.
+    fn finalizer_candidates() -> Vec<(ObjectReference, ObjectReference)> {
+        extern "C" fn visit(
+            finalizer: *mut libc::c_void,
+            referent: *mut libc::c_void,
+            ctx: *mut libc::c_void,
+        ) {
+            let out = unsafe { &mut *(ctx as *mut Vec<(ObjectReference, ObjectReference)>) };
+            // The VM skips null referents, so both are non-null here.
+            let f = ObjectReference::from_raw_address(unsafe {
+                mmtk::util::Address::from_mut_ptr(finalizer)
+            });
+            let r = ObjectReference::from_raw_address(unsafe {
+                mmtk::util::Address::from_mut_ptr(referent)
+            });
+            if let (Some(f), Some(r)) = (f, r) {
+                out.push((f, r));
+            }
+        }
+
+        let mut out: Vec<(ObjectReference, ObjectReference)> = vec![];
+        unsafe {
+            ((*UPCALLS).scan_finalizer_list)(
+                visit,
+                &mut out as *mut Vec<(ObjectReference, ObjectReference)> as *mut libc::c_void,
+            );
+        }
+        out
+    }
+
+    fn enqueue_finalizers(refs: &[ObjectReference]) -> Option<ObjectReference> {
+        crate::reference_glue::enqueue_finalizers::<COMPRESSED>(refs)
     }
 
     fn clear_cld_claimed_marks() {

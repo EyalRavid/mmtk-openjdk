@@ -157,6 +157,9 @@ extern size_t mmtk_verbose();
 extern size_t free_bytes();
 extern size_t total_bytes();
 
+/// Callback for scan_finalizer_list: one call per registered finalizable object.
+typedef void (*MMTkFinalizerVisitor)(void* finalizer, void* referent, void* ctx);
+
 typedef struct {
     void** buf;
     size_t cap;
@@ -230,6 +233,9 @@ typedef struct {
     void (*clear_claimed_marks)();
     void (*unload_classes)();
     void (*gc_epilogue)();
+    /// Walk java.lang.ref.Finalizer.unfinalized, invoking `visit` per (finalizer, referent).
+    /// Stop-the-world only. See mmtk_scan_finalizer_list in mmtkUpcalls.cpp.
+    void (*scan_finalizer_list)(MMTkFinalizerVisitor visit, void* ctx);
 } OpenJDK_Upcalls;
 
 extern void openjdk_gc_init(OpenJDK_Upcalls *calls);

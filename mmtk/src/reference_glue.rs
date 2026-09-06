@@ -46,6 +46,34 @@ fn set_next_reference<const COMPRESSED: bool>(
     slot.store(next)
 }
 
+/// Chain `refs` through their `discovered` fields and splice them onto the VM's pending
+/// reference list, so Java's ReferenceHandler thread hands them to the FinalizerThread.
+///
+/// This is the tail of `ProcessDiscoveredList::do_work` factored out: same chaining, same
+/// `swap_reference_pending_list` upcall, no lock. It deliberately does NOT go through
+/// `UPCALLS.enqueue_references`, which takes `Heap_lock` -- that path has no caller in this
+/// fork and taking a VM lock from an MMTk worker mid-pause is not something to try blind.
+///
+/// The referent is NOT cleared: these are FinalReferences, and `finalize()` still needs the
+/// object. `Finalizer.runFinalizer` clears it afterwards, from Java, through the barrier.
+/// Returns the previous head of the pending list, so the caller can account for the RC edge
+/// created by pointing our tail at it. See the caller in `CycleCollector::all_buff_gc`.
+pub fn enqueue_finalizers<const COMPRESSED: bool>(
+    refs: &[ObjectReference],
+) -> Option<ObjectReference> {
+    if refs.is_empty() {
+        return None;
+    }
+    for w in refs.windows(2) {
+        set_next_reference::<COMPRESSED>(w[0], Some(w[1]));
+    }
+    let head = refs[0];
+    let tail = refs[refs.len() - 1];
+    let old_head = unsafe { ((*crate::UPCALLS).swap_reference_pending_list)(head) };
+    set_next_reference::<COMPRESSED>(tail, old_head);
+    old_head
+}
+
 pub struct VMReferenceGlue {}
 
 impl<const COMPRESSED: bool> ReferenceGlue<OpenJDK<COMPRESSED>> for VMReferenceGlue {
@@ -308,7 +336,7 @@ impl<E: ProcessEdgesWork, const COMPRESSED: bool> GCWork<E::VM>
                 unsafe { *slot = Some(head) };
             } else {
                 let old_head = unsafe { ((*crate::UPCALLS).swap_reference_pending_list)(head) };
-                set_next_reference::<COMPRESSED>(tail, Some(old_head));
+                set_next_reference::<COMPRESSED>(tail, old_head);
             }
         } else {
             if self.rt == ReferenceType::Final {
@@ -353,7 +381,7 @@ impl<E: ProcessEdgesWork, const COMPRESSED: bool> GCWork<E::VM>
             let slot = DISCOVERED_LISTS.r#final[self.list_index].head.get();
             unsafe { *slot = ObjectReference::NULL };
             let old_head = unsafe { ((*crate::UPCALLS).swap_reference_pending_list)(head) };
-            set_next_reference::<COMPRESSED>(tail, Some(old_head));
+            set_next_reference::<COMPRESSED>(tail, old_head);
         }
         trace.process_slots();
         trace.flush();
