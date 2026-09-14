@@ -236,6 +236,9 @@ typedef struct {
     /// Walk java.lang.ref.Finalizer.unfinalized, invoking `visit` per (finalizer, referent).
     /// Stop-the-world only. See mmtk_scan_finalizer_list in mmtkUpcalls.cpp.
     void (*scan_finalizer_list)(MMTkFinalizerVisitor visit, void* ctx);
+    /// Head of java.lang.ref.Finalizer.unfinalized, or NULL. Stop-the-world only.
+    /// MUST stay last -- this struct is matched by position against mmtk/src/lib.rs.
+    void* (*finalizer_list_head)();
 } OpenJDK_Upcalls;
 
 extern void openjdk_gc_init(OpenJDK_Upcalls *calls);

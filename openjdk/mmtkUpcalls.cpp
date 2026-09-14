@@ -563,26 +563,60 @@ static void* mmtk_swap_reference_pending_list(void* object) {
 // links the ReferenceQueue. `JavaFieldStream` iterates only the fields declared *locally* on
 // the klass it is given, which is what keeps these apart -- do not switch it to a lookup that
 // walks superclasses.
-static void mmtk_scan_finalizer_list(MMTkFinalizerVisitor visit, void* ctx) {
-  static int unfinalized_offset = -1;
-  static int next_offset = -1;
+// Resolve `Finalizer.unfinalized` (static) and `Finalizer.next` (instance) once, into the
+// file-scope statics below. Returns false if the Finalizer klass is not initialized yet.
+//
+// Hoisted out of `mmtk_scan_finalizer_list` because `mmtk_finalizer_list_head` needs the same
+// `unfinalized` offset, and resolving it twice in two places is how the two copies drift.
+static int finalizer_unfinalized_offset = -1;
+static int finalizer_next_offset = -1;
 
+static bool mmtk_resolve_finalizer_offsets(InstanceKlass** out_ik) {
   InstanceKlass* ik = SystemDictionary::Finalizer_klass();
-  if (ik == NULL || !ik->is_initialized()) return;
+  if (ik == NULL || !ik->is_initialized()) return false;
+  *out_ik = ik;
 
-  if (unfinalized_offset < 0 || next_offset < 0) {
+  if (finalizer_unfinalized_offset < 0 || finalizer_next_offset < 0) {
     for (JavaFieldStream fs(ik); !fs.done(); fs.next()) {
       if (fs.name()->equals("unfinalized")) {
         guarantee(fs.access_flags().is_static(), "Finalizer.unfinalized must be static");
-        unfinalized_offset = fs.offset();
+        finalizer_unfinalized_offset = fs.offset();
       } else if (fs.name()->equals("next")) {
         guarantee(!fs.access_flags().is_static(), "Finalizer.next must be an instance field");
-        next_offset = fs.offset();
+        finalizer_next_offset = fs.offset();
       }
     }
-    guarantee(unfinalized_offset >= 0 && next_offset >= 0,
+    guarantee(finalizer_unfinalized_offset >= 0 && finalizer_next_offset >= 0,
               "could not resolve Finalizer.unfinalized / Finalizer.next");
   }
+  return true;
+}
+
+// The head of `java.lang.ref.Finalizer.unfinalized`, or NULL.
+//
+// This static field is the ONE reference into the unfinalized chain from outside it: the chain is
+// otherwise linked only by its own `Finalizer.next`/`prev`. The collector subtracts exactly this
+// edge to make the chain trial-deletable, then puts it back -- see FINALIZER_RC_PLAN step 3A/3B.
+//
+// Deliberately NOT derived from `mmtk_scan_finalizer_list`'s first reported pair: that walk SKIPS
+// finalizers already handed to Java, so its first report is not necessarily the list head. Cutting
+// the edge into a non-head node would leave the real head still rooted and the nodes in front of
+// the cut unreachable from the seed.
+//
+// STOP-THE-WORLD ONLY, as the walk is.
+static void* mmtk_finalizer_list_head() {
+  InstanceKlass* ik = NULL;
+  if (!mmtk_resolve_finalizer_offsets(&ik)) return NULL;
+  // A static field lives in the klass mirror.
+  return (void*) HeapAccess<AS_NO_KEEPALIVE>::oop_load_at(
+      ik->java_mirror(), finalizer_unfinalized_offset);
+}
+
+static void mmtk_scan_finalizer_list(MMTkFinalizerVisitor visit, void* ctx) {
+  InstanceKlass* ik = NULL;
+  if (!mmtk_resolve_finalizer_offsets(&ik)) return;
+  const int unfinalized_offset = finalizer_unfinalized_offset;
+  const int next_offset = finalizer_next_offset;
 
   // Bounded walk. Every anomaly below is impossible if the list is well formed -- but a
   // malformed list must not be able to hang the VM or silently truncate the walk, because both
@@ -731,4 +765,5 @@ OpenJDK_Upcalls mmtk_upcalls = {
   mmtk_unload_classes,
   mmtk_gc_epilogue,
   mmtk_scan_finalizer_list,
+  mmtk_finalizer_list_head,
 };

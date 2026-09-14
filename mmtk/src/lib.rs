@@ -163,6 +163,11 @@ pub struct OpenJDK_Upcalls {
         visit: extern "C" fn(*mut libc::c_void, *mut libc::c_void, *mut libc::c_void),
         ctx: *mut libc::c_void,
     ),
+    /// Head of `java.lang.ref.Finalizer.unfinalized`, or null. Stop-the-world only.
+    ///
+    /// APPENDED LAST, and must stay last -- see `scan_finalizer_list` above for why position
+    /// matters here.
+    pub finalizer_list_head: extern "C" fn() -> *mut libc::c_void,
 }
 
 lazy_static! {

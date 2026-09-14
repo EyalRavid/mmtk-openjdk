@@ -133,6 +133,11 @@ impl<const COMPRESSED: bool> Collection<OpenJDK<COMPRESSED>> for VMCollection {
         out
     }
 
+    fn finalizer_list_head() -> Option<ObjectReference> {
+        let p = unsafe { ((*UPCALLS).finalizer_list_head)() };
+        ObjectReference::from_raw_address(unsafe { mmtk::util::Address::from_mut_ptr(p) })
+    }
+
     fn enqueue_finalizers(refs: &[ObjectReference]) -> Option<ObjectReference> {
         crate::reference_glue::enqueue_finalizers::<COMPRESSED>(refs)
     }
