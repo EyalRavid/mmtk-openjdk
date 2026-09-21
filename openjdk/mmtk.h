@@ -236,9 +236,15 @@ typedef struct {
     /// Walk java.lang.ref.Finalizer.unfinalized, invoking `visit` per (finalizer, referent).
     /// Stop-the-world only. See mmtk_scan_finalizer_list in mmtkUpcalls.cpp.
     void (*scan_finalizer_list)(MMTkFinalizerVisitor visit, void* ctx);
-    /// Head of java.lang.ref.Finalizer.unfinalized, or NULL. Stop-the-world only.
+    /// Take the head of java.lang.ref.Finalizer.unfinalized: return it and NULL the static,
+    /// writing the owning class mirror to `mirror_out`. The collector accounts the removed edge
+    /// by hand, so the store is raw; nulling the slot is what stops the traversal subtracting
+    /// the same edge a second time. See mmtk_finalizer_take_list_head in mmtkUpcalls.cpp.
+    /// Stop-the-world only, and MUST be paired with finalizer_restore_list_head.
+    void* (*finalizer_take_list_head)(void** mirror_out);
+    /// Put the head back. Stop-the-world only.
     /// MUST stay last -- this struct is matched by position against mmtk/src/lib.rs.
-    void* (*finalizer_list_head)();
+    void (*finalizer_restore_list_head)(void* head);
 } OpenJDK_Upcalls;
 
 extern void openjdk_gc_init(OpenJDK_Upcalls *calls);

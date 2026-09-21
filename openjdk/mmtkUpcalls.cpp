@@ -566,7 +566,7 @@ static void* mmtk_swap_reference_pending_list(void* object) {
 // Resolve `Finalizer.unfinalized` (static) and `Finalizer.next` (instance) once, into the
 // file-scope statics below. Returns false if the Finalizer klass is not initialized yet.
 //
-// Hoisted out of `mmtk_scan_finalizer_list` because `mmtk_finalizer_list_head` needs the same
+// Hoisted out of `mmtk_scan_finalizer_list` because `mmtk_finalizer_take_list_head` needs the same
 // `unfinalized` offset, and resolving it twice in two places is how the two copies drift.
 static int finalizer_unfinalized_offset = -1;
 static int finalizer_next_offset = -1;
@@ -592,24 +592,69 @@ static bool mmtk_resolve_finalizer_offsets(InstanceKlass** out_ik) {
   return true;
 }
 
-// The head of `java.lang.ref.Finalizer.unfinalized`, or NULL.
+// TAKE the head of `java.lang.ref.Finalizer.unfinalized`: return it AND null the static.
 //
 // This static field is the ONE reference into the unfinalized chain from outside it: the chain is
 // otherwise linked only by its own `Finalizer.next`/`prev`. The collector subtracts exactly this
 // edge to make the chain trial-deletable, then puts it back -- see FINALIZER_RC_PLAN step 3A/3B.
+//
+// ## Why this NULLS the slot, and why that is the whole point
+//
+// It used to only READ the head, leaving the pointer in place while the collector
+// hand-decremented the head's reference count. That is a hand-cut that removes the edge from the
+// COUNT but not from the HEAP -- and `Finalizer.unfinalized` is a static, so it lives in the
+// `java.lang.ref.Finalizer` class mirror, which is an ordinary Java object with ordinary oop
+// fields. `InstanceMirrorKlass::oop_iterate` walks a mirror's static fields unconditionally (it
+// is not gated on `should_follow_clds`), so whenever trial deletion greys the mirror,
+// `CycleCollector::mark` finds this pointer and subtracts the SAME edge a second time.
+//
+// Measured: on `jython` the head went one below the trial-deletion floor (rc 1 -> 0), `scan_black`
+// then reconstructed its strong count from that transient value as `1 - 1 == 0`, and the object
+// ended the collection live with `strong_rc == 0` and no candidate tag -- unfileable by any later
+// collection, because candidacy is only ever created by a strong count going 1 -> 0. Everything it
+// anchored leaked, and `sanity_checker.rs`'s "zero strong rc count" assertion fired on it.
+//
+// Nulling the slot makes the double subtraction structurally impossible: `mark` reads NULL and
+// subtracts nothing, so the hand-decrement in step 3A is the only subtraction and the
+// hand-increment in step 3B is its exact inverse.
+//
+// The store is RAW (`obj_field_put_raw` == `RawAccess<>::oop_store_at`), deliberately. A barriered
+// store would log the slot and queue the decrement for AFTER the pause, so the head's count would
+// not fall during this collection and trial deletion would classify nothing.
+//
+// `mirror_out` receives the mirror itself, for the collector's diagnostics.
 //
 // Deliberately NOT derived from `mmtk_scan_finalizer_list`'s first reported pair: that walk SKIPS
 // finalizers already handed to Java, so its first report is not necessarily the list head. Cutting
 // the edge into a non-head node would leave the real head still rooted and the nodes in front of
 // the cut unreachable from the seed.
 //
-// STOP-THE-WORLD ONLY, as the walk is.
-static void* mmtk_finalizer_list_head() {
+// STOP-THE-WORLD ONLY, as the walk is. The caller MUST pair this with
+// `mmtk_finalizer_restore_list_head` before the pause ends -- mutators resuming to a nulled
+// `unfinalized` would lose every pending finalizer.
+static void* mmtk_finalizer_take_list_head(void** mirror_out) {
+  if (mirror_out != NULL) *mirror_out = NULL;
   InstanceKlass* ik = NULL;
   if (!mmtk_resolve_finalizer_offsets(&ik)) return NULL;
   // A static field lives in the klass mirror.
-  return (void*) HeapAccess<AS_NO_KEEPALIVE>::oop_load_at(
-      ik->java_mirror(), finalizer_unfinalized_offset);
+  oop mirror = ik->java_mirror();
+  if (mirror_out != NULL) *mirror_out = (void*) mirror;
+  oop head = HeapAccess<AS_NO_KEEPALIVE>::oop_load_at(mirror, finalizer_unfinalized_offset);
+  if (head != NULL) {
+    mirror->obj_field_put_raw(finalizer_unfinalized_offset, oop(NULL));
+  }
+  return (void*) head;
+}
+
+// Put the head back into `java.lang.ref.Finalizer.unfinalized`. The inverse of
+// `mmtk_finalizer_take_list_head`, and it must run before the pause ends.
+//
+// RAW again, for the same reason: the collector accounts this edge by hand, and a barriered store
+// here would queue a second, spurious increment of the head at the next increment phase.
+static void mmtk_finalizer_restore_list_head(void* head) {
+  InstanceKlass* ik = NULL;
+  if (!mmtk_resolve_finalizer_offsets(&ik)) return;
+  ik->java_mirror()->obj_field_put_raw(finalizer_unfinalized_offset, oop(head));
 }
 
 static void mmtk_scan_finalizer_list(MMTkFinalizerVisitor visit, void* ctx) {
@@ -765,5 +810,6 @@ OpenJDK_Upcalls mmtk_upcalls = {
   mmtk_unload_classes,
   mmtk_gc_epilogue,
   mmtk_scan_finalizer_list,
-  mmtk_finalizer_list_head,
+  mmtk_finalizer_take_list_head,
+  mmtk_finalizer_restore_list_head,
 };

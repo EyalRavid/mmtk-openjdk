@@ -133,9 +133,21 @@ impl<const COMPRESSED: bool> Collection<OpenJDK<COMPRESSED>> for VMCollection {
         out
     }
 
-    fn finalizer_list_head() -> Option<ObjectReference> {
-        let p = unsafe { ((*UPCALLS).finalizer_list_head)() };
-        ObjectReference::from_raw_address(unsafe { mmtk::util::Address::from_mut_ptr(p) })
+    fn finalizer_take_list_head() -> Option<(ObjectReference, ObjectReference)> {
+        let mut mirror: *mut libc::c_void = std::ptr::null_mut();
+        let p = unsafe { ((*UPCALLS).finalizer_take_list_head)(&mut mirror as *mut _) };
+        let head =
+            ObjectReference::from_raw_address(unsafe { mmtk::util::Address::from_mut_ptr(p) })?;
+        let mirror = ObjectReference::from_raw_address(unsafe {
+            mmtk::util::Address::from_mut_ptr(mirror)
+        })?;
+        Some((head, mirror))
+    }
+
+    fn finalizer_restore_list_head(head: ObjectReference) {
+        unsafe {
+            ((*UPCALLS).finalizer_restore_list_head)(head.to_raw_address().to_mut_ptr());
+        }
     }
 
     fn enqueue_finalizers(refs: &[ObjectReference]) -> Option<ObjectReference> {

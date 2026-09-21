@@ -163,11 +163,23 @@ pub struct OpenJDK_Upcalls {
         visit: extern "C" fn(*mut libc::c_void, *mut libc::c_void, *mut libc::c_void),
         ctx: *mut libc::c_void,
     ),
-    /// Head of `java.lang.ref.Finalizer.unfinalized`, or null. Stop-the-world only.
+    /// Take the head of `java.lang.ref.Finalizer.unfinalized`: return it and NULL the static,
+    /// writing the owning class mirror to the out-parameter.
+    ///
+    /// Nulling the slot is the point. The collector removes this edge from the head's reference
+    /// count by hand, and the static lives in the `Finalizer` class mirror -- an ordinary Java
+    /// object whose fields the trial-deletion walk iterates. Leaving the pointer in place while
+    /// the count says it is gone is what let `CycleCollector::mark` subtract the same edge twice.
+    ///
+    /// Stop-the-world only, and MUST be paired with `finalizer_restore_list_head` before the
+    /// pause ends.
+    pub finalizer_take_list_head:
+        extern "C" fn(mirror_out: *mut *mut libc::c_void) -> *mut libc::c_void,
+    /// Put the head back. Stop-the-world only.
     ///
     /// APPENDED LAST, and must stay last -- see `scan_finalizer_list` above for why position
     /// matters here.
-    pub finalizer_list_head: extern "C" fn() -> *mut libc::c_void,
+    pub finalizer_restore_list_head: extern "C" fn(head: *mut libc::c_void),
 }
 
 lazy_static! {
