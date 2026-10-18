@@ -47,6 +47,7 @@
 #include "gc/shared/oopStorage.inline.hpp"
 #include "utilities/debug.hpp"
 #include "classfile/systemDictionary.hpp"
+#include "classfile/classLoaderData.hpp"
 #include "oops/fieldStreams.hpp"
 #include "logging/log.hpp"
 #include "prims/jvmtiExport.hpp"
@@ -746,6 +747,173 @@ static void mmtk_scan_finalizer_list(MMTkFinalizerVisitor visit, void* ctx) {
   }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Cleaner chains -- ~/mmtk/CLEANER_RC_PLAN.md.
+//
+// These upcalls only FIND and WALK the cleaner lists; they change nothing in the heap (take/restore
+// below are used by the binding just to read the head and put it straight back). The collector then
+// cuts each eligible cleaner's `referent` edge, lets trial deletion decide which referents are
+// wanted by nothing but `referent` fields, restores the others, and enqueues the cleaners of the
+// rest -- CLEANER_RC_PLAN.md §12. (An earlier version cut the list's root instead; that is wrong as
+// soon as any node is live, §12.1.)
+//
+//   kind 0  jdk.internal.ref.Cleaner        static `first`, linear list through `Cleaner.next`
+//   kind 1  java.lang.ref.Cleaner phantoms  CleanerImpl.phantomCleanableList -> dummy root of a
+//                                           RING through `PhantomCleanable.next`
+//   kind 2  java.lang.ref.Cleaner weaks     CleanerImpl.weakCleanableList    -> dummy root of a
+//                                           RING through `WeakCleanable.next`
+//
+// A chain is reported as (holder, field offset, kind): the object whose oop field points at the
+// chain's head -- the class mirror for the static of kind 0, the CleanerImpl for kinds 1/2. Every
+// CleanerImpl is found through the thread that runs it (`Thread.target`); each live
+// java.lang.ref.Cleaner has exactly one.
+//
+// All of this is STOP-THE-WORLD ONLY (the lists are guarded by Java-level locks and nothing here
+// takes them), and all stores are RAW: the collector accounts every edge it moves by hand.
+// ---------------------------------------------------------------------------------------------
+
+enum { MMTK_CHAIN_JDK_CLEANER = 0, MMTK_CHAIN_PHANTOM_RING = 1, MMTK_CHAIN_WEAK_RING = 2 };
+
+// Cached shapes. A klass that is not loaded yet (no direct buffer / no Cleaner created) resolves
+// to NULL and is looked up again next time; once found it never changes (boot classes are never
+// unloaded).
+static InstanceKlass* cleaner_jdk_ik = NULL;        // jdk.internal.ref.Cleaner
+static int cleaner_jdk_first_offset = -1;           //   static first
+static int cleaner_jdk_next_offset = -1;            //   next
+static InstanceKlass* cleaner_impl_ik = NULL;       // jdk.internal.ref.CleanerImpl
+static int cleaner_impl_phantom_offset = -1;        //   phantomCleanableList
+static int cleaner_impl_weak_offset = -1;           //   weakCleanableList
+static int phantom_cleanable_next_offset = -1;      // jdk.internal.ref.PhantomCleanable.next
+static int weak_cleanable_next_offset = -1;         // jdk.internal.ref.WeakCleanable.next
+static int thread_target_offset = -1;               // java.lang.Thread.target
+
+// Find loaded AND initialized boot classes by name, without loading anything and without the
+// system dictionary: `SystemDictionary::find` -> `Dictionary::find` installs a NoSafepointVerifier
+// whose NoGCVerifier asserts `!is_gc_active()`, so it cannot be called from inside a pause
+// (caught by slowdebug). Instead walk the boot loader's own class list, lock-free, as
+// `ClassLoaderData::classes_do` does at safepoints. Each class is looked for only until found.
+class MMTkFindBootKlasses : public KlassClosure {
+ public:
+  const char* const* names;
+  InstanceKlass** out;
+  int n;
+  MMTkFindBootKlasses(const char* const* names, InstanceKlass** out, int n) : names(names), out(out), n(n) {}
+  void do_klass(Klass* k) {
+    if (!k->is_instance_klass()) return;
+    for (int i = 0; i < n; i++) {
+      if (out[i] == NULL && k->name()->equals(names[i])) {
+        InstanceKlass* ik = InstanceKlass::cast(k);
+        if (ik->is_initialized()) out[i] = ik;
+      }
+    }
+  }
+};
+
+// A field DECLARED on exactly this klass (JavaFieldStream does not walk superclasses -- which is
+// what keeps `PhantomCleanable.next` / `Cleaner.next` apart from `Reference.next`).
+static int mmtk_declared_field_offset(InstanceKlass* ik, const char* name, bool is_static) {
+  for (JavaFieldStream fs(ik); !fs.done(); fs.next()) {
+    if (fs.name()->equals(name) && fs.access_flags().is_static() == is_static) return fs.offset();
+  }
+  return -1;
+}
+
+static void mmtk_resolve_cleaner_shapes() {
+  if (cleaner_jdk_ik != NULL && cleaner_impl_ik != NULL) return;
+  static const char* const names[] = { "jdk/internal/ref/Cleaner", "jdk/internal/ref/CleanerImpl",
+                                       "jdk/internal/ref/PhantomCleanable",
+                                       "jdk/internal/ref/WeakCleanable" };
+  InstanceKlass* found[4] = { cleaner_jdk_ik, cleaner_impl_ik, NULL, NULL };
+  MMTkFindBootKlasses finder(names, found, 4);
+  ClassLoaderData::the_null_class_loader_data()->classes_do(&finder);
+
+  if (cleaner_jdk_ik == NULL && found[0] != NULL) {
+    cleaner_jdk_first_offset = mmtk_declared_field_offset(found[0], "first", true);
+    cleaner_jdk_next_offset = mmtk_declared_field_offset(found[0], "next", false);
+    guarantee(cleaner_jdk_first_offset >= 0 && cleaner_jdk_next_offset >= 0,
+              "could not resolve jdk.internal.ref.Cleaner.first / next");
+    cleaner_jdk_ik = found[0];
+  }
+  if (cleaner_impl_ik == NULL && found[1] != NULL && found[2] != NULL && found[3] != NULL) {
+    cleaner_impl_phantom_offset = mmtk_declared_field_offset(found[1], "phantomCleanableList", false);
+    cleaner_impl_weak_offset = mmtk_declared_field_offset(found[1], "weakCleanableList", false);
+    phantom_cleanable_next_offset = mmtk_declared_field_offset(found[2], "next", false);
+    weak_cleanable_next_offset = mmtk_declared_field_offset(found[3], "next", false);
+    thread_target_offset = mmtk_declared_field_offset(SystemDictionary::Thread_klass(), "target", false);
+    guarantee(cleaner_impl_phantom_offset >= 0 && cleaner_impl_weak_offset >= 0 &&
+              phantom_cleanable_next_offset >= 0 && weak_cleanable_next_offset >= 0 &&
+              thread_target_offset >= 0,
+              "could not resolve CleanerImpl / PhantomCleanable / WeakCleanable / Thread fields");
+    cleaner_impl_ik = found[1];
+  }
+}
+
+// Report every chain as (holder, offset, kind).
+static void mmtk_scan_cleaner_chains(MMTkChainVisitor visit, void* ctx) {
+  mmtk_resolve_cleaner_shapes();
+  if (cleaner_jdk_ik != NULL) {
+    visit((void*) cleaner_jdk_ik->java_mirror(), (size_t) cleaner_jdk_first_offset,
+          MMTK_CHAIN_JDK_CLEANER, ctx);
+  }
+  if (cleaner_impl_ik != NULL) {
+    JavaThread* jt;
+    for (JavaThreadIteratorWithHandle jtiwh; (jt = jtiwh.next());) {
+      oop t = jt->threadObj();
+      if (t == NULL) continue;
+      oop target = HeapAccess<AS_NO_KEEPALIVE>::oop_load_at(t, thread_target_offset);
+      if (target == NULL || target->klass() != cleaner_impl_ik) continue;
+      visit((void*) target, (size_t) cleaner_impl_phantom_offset, MMTK_CHAIN_PHANTOM_RING, ctx);
+      visit((void*) target, (size_t) cleaner_impl_weak_offset, MMTK_CHAIN_WEAK_RING, ctx);
+    }
+  }
+}
+
+// TAKE: return the head and null the field (raw). The binding calls chain_restore_head right after
+// walking, inside the same upcall sequence, so the list is never left cut.
+static void* mmtk_chain_take_head(void* holder, size_t offset) {
+  oop h = HeapAccess<AS_NO_KEEPALIVE>::oop_load_at((oop) holder, (int) offset);
+  if (h != NULL) ((oop) holder)->obj_field_put_raw((int) offset, oop(NULL));
+  return (void*) h;
+}
+
+static void mmtk_chain_restore_head(void* holder, size_t offset, void* head) {
+  ((oop) holder)->obj_field_put_raw((int) offset, oop(head));
+}
+
+// Walk a chain from its (taken) head and report EVERY node as (node, referent-or-NULL). The
+// referent is NULL when the node is not eligible: already handed to Java (`discovered` or
+// `Reference.next` set, as in mmtk_scan_finalizer_list) or already cleared. Ineligible nodes are
+// reported too (with NULL) so the collector's log can count them; it acts only on eligible ones.
+//
+// Kind 0 is linear and starts AT the head (the head is a real Cleaner). Kinds 1/2 are rings that
+// start AFTER the head (the head is the dummy root, whose referent is NULL) and stop on returning
+// to it.
+static void mmtk_scan_chain(void* head, int kind, MMTkFinalizerVisitor visit, void* ctx) {
+  const size_t MAX_CHAIN_WALK = 10 * 1000 * 1000;
+  const int next_offset = kind == MMTK_CHAIN_JDK_CLEANER ? cleaner_jdk_next_offset
+                        : kind == MMTK_CHAIN_PHANTOM_RING ? phantom_cleanable_next_offset
+                        : weak_cleanable_next_offset;
+  guarantee(next_offset >= 0, "chain shapes not resolved");
+  oop root = (oop) head;
+  oop n = kind == MMTK_CHAIN_JDK_CLEANER ? root : HeapAccess<AS_NO_KEEPALIVE>::oop_load_at(root, next_offset);
+  size_t walked = 0;
+  while (n != NULL && !(kind != MMTK_CHAIN_JDK_CLEANER && n == root)) {
+    if (++walked > MAX_CHAIN_WALK) {
+      log_warning(gc)("MMTk: cleaner chain (kind %d) walk exceeded " SIZE_FORMAT
+                      " nodes and was abandoned", kind, MAX_CHAIN_WALK);
+      break;
+    }
+    oop referent = HeapAccess<AS_NO_KEEPALIVE>::oop_load_at(n, java_lang_ref_Reference::referent_offset);
+    oop discovered = HeapAccess<AS_NO_KEEPALIVE>::oop_load_at(n, java_lang_ref_Reference::discovered_offset);
+    oop ref_next = HeapAccess<AS_NO_KEEPALIVE>::oop_load_at(n, java_lang_ref_Reference::next_offset);
+    bool eligible = referent != NULL && discovered == NULL && ref_next == NULL;
+    visit((void*) n, eligible ? (void*) referent : NULL, ctx);
+    oop next = HeapAccess<AS_NO_KEEPALIVE>::oop_load_at(n, next_offset);
+    if (next == n) break;   // removed node (clean() self-links it); must not be reachable
+    n = next;
+  }
+}
+
 static size_t mmtk_java_lang_class_klass_offset_in_bytes() {
   auto v = java_lang_Class::klass_offset_in_bytes();
   guarantee(v != 0 && v != -1, "checking");
@@ -812,4 +980,8 @@ OpenJDK_Upcalls mmtk_upcalls = {
   mmtk_scan_finalizer_list,
   mmtk_finalizer_take_list_head,
   mmtk_finalizer_restore_list_head,
+  mmtk_scan_cleaner_chains,
+  mmtk_chain_take_head,
+  mmtk_chain_restore_head,
+  mmtk_scan_chain,
 };

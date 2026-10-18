@@ -74,6 +74,25 @@ pub fn enqueue_finalizers<const COMPRESSED: bool>(
     old_head
 }
 
+/// Null `reference.referent` with a RAW store and return what it held (`CLEANER_RC_PLAN.md` §12):
+/// the collector takes the edge out of trial deletion and accounts it itself.
+pub fn clear_referent_raw<const COMPRESSED: bool>(
+    reference: ObjectReference,
+) -> Option<ObjectReference> {
+    let old = get_referent::<COMPRESSED>(reference);
+    set_referent::<COMPRESSED>(reference, None);
+    old
+}
+
+/// Store `referent` back into `reference.referent` with a RAW store -- the inverse of
+/// [`clear_referent_raw`]; the collector accounts the edge.
+pub fn restore_referent_raw<const COMPRESSED: bool>(
+    reference: ObjectReference,
+    referent: ObjectReference,
+) {
+    set_referent::<COMPRESSED>(reference, Some(referent));
+}
+
 pub struct VMReferenceGlue {}
 
 impl<const COMPRESSED: bool> ReferenceGlue<OpenJDK<COMPRESSED>> for VMReferenceGlue {

@@ -154,6 +154,89 @@ impl<const COMPRESSED: bool> Collection<OpenJDK<COMPRESSED>> for VMCollection {
         crate::reference_glue::enqueue_finalizers::<COMPRESSED>(refs)
     }
 
+    /// Enumerate and walk every Cleaner chain (`CLEANER_RC_PLAN.md` §12, upcalls in
+    /// `mmtkUpcalls.cpp`). The head is taken only for the length of the walk and put straight
+    /// back, so the heap is unchanged on return.
+    fn cleaner_chains() -> Vec<mmtk::vm::CleanerChain> {
+        extern "C" fn visit_chain(
+            holder: *mut libc::c_void,
+            offset: usize,
+            kind: i32,
+            ctx: *mut libc::c_void,
+        ) {
+            let out = unsafe { &mut *(ctx as *mut Vec<(*mut libc::c_void, usize, i32)>) };
+            out.push((holder, offset, kind));
+        }
+        extern "C" fn visit_node(
+            node: *mut libc::c_void,
+            referent: *mut libc::c_void,
+            ctx: *mut libc::c_void,
+        ) {
+            let out =
+                unsafe { &mut *(ctx as *mut Vec<(ObjectReference, Option<ObjectReference>)>) };
+            let n = ObjectReference::from_raw_address(unsafe {
+                mmtk::util::Address::from_mut_ptr(node)
+            });
+            let r = ObjectReference::from_raw_address(unsafe {
+                mmtk::util::Address::from_mut_ptr(referent)
+            });
+            if let Some(n) = n {
+                out.push((n, r));
+            }
+        }
+
+        let mut found: Vec<(*mut libc::c_void, usize, i32)> = vec![];
+        unsafe {
+            ((*UPCALLS).scan_cleaner_chains)(
+                visit_chain,
+                &mut found as *mut Vec<(*mut libc::c_void, usize, i32)> as *mut libc::c_void,
+            );
+        }
+        let mut chains = vec![];
+        for (holder, offset, kind) in found {
+            let head = unsafe { ((*UPCALLS).chain_take_head)(holder, offset) };
+            let Some(head_ref) =
+                ObjectReference::from_raw_address(unsafe { mmtk::util::Address::from_mut_ptr(head) })
+            else {
+                continue;
+            };
+            let Some(holder_ref) = ObjectReference::from_raw_address(unsafe {
+                mmtk::util::Address::from_mut_ptr(holder)
+            }) else {
+                // Unreachable: the VM reported a null holder. Put the head back and skip.
+                unsafe { ((*UPCALLS).chain_restore_head)(holder, offset, head) };
+                continue;
+            };
+            let mut nodes: Vec<(ObjectReference, Option<ObjectReference>)> = vec![];
+            unsafe {
+                ((*UPCALLS).scan_chain)(
+                    head,
+                    kind,
+                    visit_node,
+                    &mut nodes as *mut Vec<(ObjectReference, Option<ObjectReference>)>
+                        as *mut libc::c_void,
+                );
+            }
+            // Put the head back at once: the collector cuts referent edges, not the list.
+            unsafe { ((*UPCALLS).chain_restore_head)(holder, offset, head) };
+            let _ = (head_ref, holder_ref);
+            chains.push(mmtk::vm::CleanerChain { vm_kind: kind as usize, nodes });
+        }
+        chains
+    }
+
+    fn clear_referent_raw(reference: ObjectReference) -> Option<ObjectReference> {
+        crate::reference_glue::clear_referent_raw::<COMPRESSED>(reference)
+    }
+
+    fn restore_referent_raw(reference: ObjectReference, referent: ObjectReference) {
+        crate::reference_glue::restore_referent_raw::<COMPRESSED>(reference, referent)
+    }
+
+    fn enqueue_references_raw(refs: &[ObjectReference]) -> Option<ObjectReference> {
+        crate::reference_glue::enqueue_finalizers::<COMPRESSED>(refs)
+    }
+
     fn clear_cld_claimed_marks() {
         unsafe {
             ((*UPCALLS).clear_claimed_marks)();

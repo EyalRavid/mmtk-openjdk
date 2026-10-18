@@ -159,6 +159,8 @@ extern size_t total_bytes();
 
 /// Callback for scan_finalizer_list: one call per registered finalizable object.
 typedef void (*MMTkFinalizerVisitor)(void* finalizer, void* referent, void* ctx);
+/// Callback for scan_cleaner_chains: one call per special-reference chain (CLEANER_RC_PLAN.md).
+typedef void (*MMTkChainVisitor)(void* holder, size_t offset, int kind, void* ctx);
 
 typedef struct {
     void** buf;
@@ -243,8 +245,17 @@ typedef struct {
     /// Stop-the-world only, and MUST be paired with finalizer_restore_list_head.
     void* (*finalizer_take_list_head)(void** mirror_out);
     /// Put the head back. Stop-the-world only.
-    /// MUST stay last -- this struct is matched by position against mmtk/src/lib.rs.
     void (*finalizer_restore_list_head)(void* head);
+    /// Cleaner chains (CLEANER_RC_PLAN.md). Stop-the-world only; all stores raw.
+    /// Report every chain as (holder, field offset, kind).
+    void (*scan_cleaner_chains)(MMTkChainVisitor visit, void* ctx);
+    /// Return the head at holder+offset and NULL the field.
+    void* (*chain_take_head)(void* holder, size_t offset);
+    /// Put the head back.
+    void (*chain_restore_head)(void* holder, size_t offset, void* head);
+    /// Report every node of the chain as (node, referent or NULL if not eligible).
+    /// MUST stay last -- this struct is matched by position against mmtk/src/lib.rs.
+    void (*scan_chain)(void* head, int kind, MMTkFinalizerVisitor visit, void* ctx);
 } OpenJDK_Upcalls;
 
 extern void openjdk_gc_init(OpenJDK_Upcalls *calls);

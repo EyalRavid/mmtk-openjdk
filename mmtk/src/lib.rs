@@ -180,6 +180,26 @@ pub struct OpenJDK_Upcalls {
     /// APPENDED LAST, and must stay last -- see `scan_finalizer_list` above for why position
     /// matters here.
     pub finalizer_restore_list_head: extern "C" fn(head: *mut libc::c_void),
+    /// Cleaner chains (`~/mmtk/CLEANER_RC_PLAN.md`). Stop-the-world only; all stores raw.
+    /// Report every special-reference chain as `(holder, field offset, kind)`.
+    pub scan_cleaner_chains: extern "C" fn(
+        visit: extern "C" fn(*mut libc::c_void, usize, i32, *mut libc::c_void),
+        ctx: *mut libc::c_void,
+    ),
+    /// Return the head stored at `holder + offset` and NULL that field.
+    pub chain_take_head: extern "C" fn(holder: *mut libc::c_void, offset: usize) -> *mut libc::c_void,
+    /// Put the head back.
+    pub chain_restore_head:
+        extern "C" fn(holder: *mut libc::c_void, offset: usize, head: *mut libc::c_void),
+    /// Report every node of a chain as `(node, referent or NULL when not eligible)`.
+    ///
+    /// APPENDED LAST, and must stay last -- see `scan_finalizer_list` for why position matters.
+    pub scan_chain: extern "C" fn(
+        head: *mut libc::c_void,
+        kind: i32,
+        visit: extern "C" fn(*mut libc::c_void, *mut libc::c_void, *mut libc::c_void),
+        ctx: *mut libc::c_void,
+    ),
 }
 
 lazy_static! {
