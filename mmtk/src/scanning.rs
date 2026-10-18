@@ -90,6 +90,10 @@ impl<const COMPRESSED: bool> Scanning<OpenJDK<COMPRESSED>> for VMScanning {
         crate::object_scanning::get_obj_kind::<COMPRESSED>(unsafe { std::mem::transmute(o) })
     }
 
+    fn reference_kind(o: ObjectReference) -> u8 {
+        crate::object_scanning::reference_kind::<COMPRESSED>(unsafe { std::mem::transmute(o) })
+    }
+
     fn notify_initial_thread_scan_complete(_partial_scan: bool, _tls: VMWorkerThread) {
         // unimplemented!()
         // TODO

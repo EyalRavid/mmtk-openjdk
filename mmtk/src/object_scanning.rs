@@ -329,6 +329,24 @@ pub fn is_obj_array<const COMPRESSED: bool>(oop: Oop) -> bool {
     oop.klass::<COMPRESSED>().id == KlassID::ObjArray
 }
 
+/// The kind of `java.lang.ref.Reference` `oop` is: 0 not a Reference, 1 other, 2 soft, 3 weak,
+/// 4 final, 5 phantom. Used by mmtk-core's reference registry (`REFERENCE_PROCESSING_PLAN.md`).
+pub fn reference_kind<const COMPRESSED: bool>(oop: Oop) -> u8 {
+    let klass = oop.klass::<COMPRESSED>();
+    if klass.id != KlassID::InstanceRef {
+        return 0;
+    }
+    let rk = unsafe { klass.cast::<InstanceRefKlass>() };
+    match rk.instance_klass.reference_type {
+        ReferenceType::None => 0,
+        ReferenceType::Other => 1,
+        ReferenceType::Soft => 2,
+        ReferenceType::Weak => 3,
+        ReferenceType::Final => 4,
+        ReferenceType::Phantom => 5,
+    }
+}
+
 pub fn is_val_array<const COMPRESSED: bool>(oop: Oop) -> bool {
     oop.klass::<COMPRESSED>().id == KlassID::TypeArray
 }
