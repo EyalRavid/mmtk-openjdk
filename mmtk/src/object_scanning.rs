@@ -153,6 +153,15 @@ impl OopIterate for InstanceRefKlass {
         use crate::abi::*;
         self.instance_klass.oop_iterate::<COMPRESSED>(oop, closure);
 
+        // The LXR cycle collector's FullRC trial treats every `referent` edge itself
+        // (mmtk-core `all_buff_gc`, REFERENCE_PROCESSING_PLAN.md §4): report `discovered`, a
+        // real counted edge, but not `referent`, and discover nothing.
+        if closure.should_skip_referent() {
+            let discovered_addr = Self::discovered_address::<COMPRESSED>(oop);
+            closure.visit_slot(discovered_addr, false);
+            return;
+        }
+
         let disable_discovery = !closure.should_discover_references();
 
         if Self::should_discover_refs::<COMPRESSED>(

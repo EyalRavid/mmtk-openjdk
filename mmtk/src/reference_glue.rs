@@ -82,8 +82,9 @@ impl<const COMPRESSED: bool> ReferenceGlue<OpenJDK<COMPRESSED>> for VMReferenceG
     fn set_referent(_reff: ObjectReference, _referent: ObjectReference) {
         unreachable!();
     }
-    fn get_referent(_object: ObjectReference) -> Option<ObjectReference> {
-        unreachable!();
+    /// Read by mmtk-core's LXR cycle collector (REFERENCE_PROCESSING_PLAN.md step A).
+    fn get_referent(object: ObjectReference) -> Option<ObjectReference> {
+        get_referent::<COMPRESSED>(object)
     }
     fn enqueue_references(_references: &[ObjectReference], _tls: VMWorkerThread) {}
     fn clear_referent(_new_reference: ObjectReference) {}
